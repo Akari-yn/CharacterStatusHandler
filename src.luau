@@ -80,7 +80,7 @@
 --[[
 	TODO:
 	1. Replicate default properties on character initialization.
-  2. Refine warnings
+	2. Refine warnings
 ]]
 
 --// Services \\--
