@@ -5,9 +5,9 @@
 	Handles the application, removal, and prioritization of status effects on characters,
 	with support for stacking effects.
 
-	Author: @akari_yn
-	Date: 2025-07-13
-	Version: 0.9.0
+    Author: @akari_yn
+    Date: 2025-07-13
+    Version: 0.2.0
 
 	---------------------------------------------------------------------------
 	
@@ -20,9 +20,9 @@
 	   - `statusInfo`: A table containing the status details:
 	     - `Priority` (number): Higher numbers take precedence.
 	     - `Duration` (number): How long the status lasts in seconds. Use `math.huge` for a permanent status.
-	     - `Properties` (table): A dictionary of Humanoid properties to change.
+	     - `Properties` (table): A dictionary of properties to change.
 	       Each property is a table with a `Value` and a `StackType`.
-	       - `Value` (number): The value of the modification.
+	       - `Value` (any): The value of the modification.
 	       - `StackType` (string): How the value is applied. Can be:
 	         - "Set": Overrides the base value and all lower-priority effects.
 	         - "Add": Adds to the final value. (e.g., +10 speed).
@@ -47,41 +47,32 @@
 	local sprintStatus = {
 		Priority = 10,
 		Duration = 10,
+		Tags = {"buff", "movement"},
 		Properties = {
 			WalkSpeed = { Value = 10, StackType = "Add" }
 		}
 	}
 	StatusModule.apply(character, "Sprint", sprintStatus)
 
-	-- A coffee buff that MULTIPLIES speed by 1.2x (Priority 10)
-	-- This will stack with the sprint. Final speed = (16 * 1.2) + 10 = 29.2
-	local coffeeBuff = {
-		Priority = 10,
-		Duration = 30,
-		Properties = {
-			WalkSpeed = { Value = 1.2, StackType = "Multiply" }
-		}
-	}
-	StatusModule.apply(character, "CoffeeBuff", coffeeBuff)
-	
-	-- A "Slowed" debuff that SETS speed to 8 (Priority 20)
-	-- This has higher priority, so it overrides the sprint and coffee. Final speed = 8
-	local slowDebuff = {
-		Priority = 20,
-		Duration = 5,
-		Properties = {
-			WalkSpeed = { Value = 8, StackType = "Set" }
-		}
-	}
-	StatusModule.apply(character, "Slowed", slowDebuff)
+	-- Get statuses by tag
+	local movementBuffs = StatusModule.getStatusesByTag(character, "movement")
 	```
 ]]
 
---[[
-	TODO:
-	1. Replicate default properties on character initialization.
-	2. Refine warnings
-]]
+-- Callback order:
+-- 1. Insert
+-- 2. Update
+-- 3. OnStatusAdded/Changed
+
+-- 1. Remove
+-- 2. OnRemove
+-- 3. Update
+-- 4. OnStatusRemoved
+
+-- TODO:
+-- check replication for any desync
+-- replicate when default property changes
+-- properly handle client init request
 
 --// Services \\--
 
@@ -91,403 +82,619 @@ local Players = game:GetService("Players")
 
 --// Types \\--
 
-type stackType = "Set" | "Add" | "Multiply"
-type validProperty = "WalkSpeed" | "JumpPower" | "JumpHeight" | "MaxHealth"
+export type SyncBehaviour = "SyncAllCharacters" | "SyncAllOwnedCharacters" | "SyncOwnerOnly" | "NoSync"
+
+type Character = Model
+
+type InternalStackType = number
+type InternalApplyType = number
+
+type ExposedStackType = "Set" | "Add" | "Multiply"
+type ExposedApplyType = "Set" | "Stack"
+
+export type StackType = InternalStackType | ExposedStackType
+export type ApplyType = InternalApplyType | ExposedApplyType
 
 -- Type for a single property effect
-type PropertyEffect = {
-	Value: any,
-	StackType: stackType,
+export type PropertyEffect<V = any> = {
+	Value: V,
+	StackType: StackType,
+}
+
+type InternalPropertyEffect<V = any> = {
+	Value: V,
+	StackType: InternalStackType,
 }
 
 -- Type for the status information passed to apply()
-type StatusInfo = {
+export type StatusInfo = {
 	Priority: number?,
 	Duration: number?,
 	Timestamp: number?, -- used for synchronization
-	Properties: { [validProperty]: PropertyEffect }?,
-	Callback: ((character: Model, removed: boolean) -> ())?, -- Optional callback when status is removed or expires
+	StackCount: number?,
+
+	RemainingDuration: number?, -- used for synchronization
+
+	Tags: { string }?,
+	Properties: { [string]: PropertyEffect }?,
+
+	OnRemove: ((character: Character, removed: boolean) -> ())?, -- Optional callback when status is removed or expires
+	OnTick: ((character: Character, deltaTime: number) -> ())?, -- Optional callback for periodic updates
 }
 
-type ReadOnlyStatus = {
-	read Priority: number,
-	read Duration: number,
-	read Timestamp: number,
-	read Properties: { [validProperty]: PropertyEffect },
+type SanitizedStatusInfo = {
+	Priority: number,
+	Duration: number,
+	Timestamp: number, -- used for synchronization
+	StackCount: number,
+
+	RemainingDuration: number, -- used for synchronization
+
+	Tags: { string },
+	Properties: { [string]: InternalPropertyEffect },
+
+	OnRemove: ((character: Character, removed: boolean) -> ())?,
+	OnTick: ((character: Character, deltaTime: number) -> ())?,
 }
 
 -- Internal type for active status tracking
 type ActiveStatus = {
+	StatusName: string,
 	Priority: number,
 	Duration: number,
-	Properties: { [validProperty]: PropertyEffect },
+	RemainingDuration: number,
 	Timestamp: number,
-	Callback: ((character: Model, removed: boolean) -> ())?, -- Optional callback when status is removed or expires
+	StackCount: number,
+
+	Paused: boolean,
+
+	Tags: { string },
+	Properties: { [string]: InternalPropertyEffect },
+
+	OnRemove: ((character: Character, removed: boolean) -> ())?,
+	OnTick: ((character: Character, deltaTime: number) -> ())?,
 }
 
 -- Internal type for effect calculations
-type EffectData = {
+type EffectData<V = any> = {
+	Value: V,
+	StackType: InternalStackType,
+
 	Priority: number,
 	Timestamp: number,
-	StackType: stackType,
-	Value: number,
 }
 
-type SyncData = {
-	Character: Model,
+type ClientSyncData = {
+	Character: Character,
 	Timestamp: number,
 } & ({
 	Action: "apply",
 	StatusName: string,
 	StatusInfo: StatusInfo,
+	ApplyType: ApplyType?,
 } | {
 	Action: "remove",
 	StatusName: string,
 } | {
 	Action: "clear",
+} | {
+	Action: "init",
+	DefaultProperties: { [string]: any },
+	CharacterId: number,
+} | {
+	Action: "pause",
+	StatusName: string,
+	StatusInfo: StatusInfo,
+} | {
+	Action: "resume",
+	StatusName: string,
+} | {
+	Action: "modifyDuration",
+	StatusName: string,
+	NewDuration: number,
+	StatusInfo: StatusInfo,
 })
 
-type SyncRequestData = {
-	AllStatuses: { [string]: ActiveStatus },
-	DefaultProperties: { [validProperty]: any },
+type syncPacket = buffer
+
+type CharacterData = {
+	Id: number,
+	OwnedPlayer: Player?,
+	ActiveStatuses: { ActiveStatus },
+	DefaultProperties: { [string]: any },
+	CustomHandlers: { [string]: (character: Character, property: string, value: any) -> () },
+	Connection: RBXScriptConnection,
+}
+
+type initCharacterData = {
+	Id: number,
+	ActiveStatuses: { ActiveStatus },
+	DefaultProperties: { [string]: any },
 	Timestamp: number,
 }
 
+export type configModule = {
+	DefaultProperties: { [string]: any }?,
+	DefaultHandler: {
+		[string]: (character: Character, value: any) -> (),
+	}?,
+	SyncBehaviour: SyncBehaviour?,
+	AllowAttributesAsProperties: boolean?,
+}
+
+type disconnect = () -> ()
+
 -- Main module type with proper function signatures
-type StatusModule = {
-	---
-	-- Applies a status effect to a character.
-	-- @param character The character model.
-	-- @param statusName A unique string identifier for the status.
-	-- @param statusInfo A table with Priority, Duration, and Properties.
-	--
-	apply: (character: Model, statusName: string, statusInfo: StatusInfo) -> (),
+export type StatusModule = {
+	-- Core API
+	apply: (character: Character, statusName: string, statusInfo: StatusInfo, applyType: ApplyType?) -> (),
+	remove: (character: Character, statusName: string, timestamp: number?) -> (),
+	hasStatus: (character: Character, statusName: string) -> boolean,
+	getActiveStatuses: (character: Character) -> { string },
+	getStatusInfo: (character: Character, statusName: string) -> StatusInfo?,
+	clearAllStatuses: (character: Character, timestamp: number?) -> (),
 
-	---
-	-- Manually removes a status effect from a character.
-	-- @param character The character model.
-	-- @param statusName The identifier of the status to remove.
-	--
-	remove: (character: Model, statusName: string, timestamp: number?) -> (),
+	-- Duration Management
+	getRemainingDuration: (character: Character, statusName: string) -> number?,
+	modifyDuration: (character: Character, statusName: string, newDuration: number) -> (),
 
-	---
-	-- Initializes a character's default properties.
-	-- This should be called when a character is first added to the game.
-	-- @param character The character model to initialize.
-	-- @param defaultProperties A table of default properties for the character.
-	--
-	initCharacter: (character: Model, defaultProperties: { [validProperty]: any }?) -> (),
+	-- Pause/Resume
+	pauseStatus: (character: Character, statusName: string) -> (),
+	resumeStatus: (character: Character, statusName: string) -> (),
+	pauseAllStatuses: (character: Character) -> (),
+	resumeAllStatuses: (character: Character) -> (),
 
-	---
-	-- Removes all status effects from a character and cleans up.
-	-- This should be called when a character is removed from the game.
-	-- @param character The character model to clean up.
-	--
-	removeCharacter: (character: Model) -> (),
+	-- Character Management
+	initCharacter: (character: Character, defaultProperties: { [string]: any }?) -> (),
+	removeCharacter: (character: Character) -> (),
 
-	---
-	-- Checks if a character has a specific status effect.
-	-- @param character The character model.
-	-- @param statusName The identifier of the status to check.
-	-- @return True if the status exists, false otherwise.
-	--
-	hasStatus: (character: Model, statusName: string) -> boolean,
+	-- Tags
+	getStatusesByTag: (character: Character, tag: string) -> { string },
+	addTag: (character: Character, statusName: string, tag: string) -> (),
+	removeTag: (character: Character, statusName: string, tag: string) -> (),
 
-	---
-	-- Gets all active status effects for a character.
-	-- @param character The character model.
-	-- @return An array of status names.
-	--
-	getActiveStatuses: (character: Model) -> { string },
+	-- Stack Management
+	getStackCount: (character: Character, statusName: string) -> number?,
+	addStack: (character: Character, statusName: string, count: number?) -> (),
+	removeStack: (character: Character, statusName: string, count: number?) -> (),
 
-	---
-	-- Gets detailed information about a specific status effect.
-	-- @param character The character model.
-	-- @param statusName The identifier of the status.
-	-- @return StatusInfo table or nil if not found.
-	--
-	getStatusInfo: (character: Model, statusName: string) -> StatusInfo?,
+	-- Properties
+	getEffectiveProperty: (character: Character, property: string) -> any,
+	getBaseProperty: (character: Character, property: string) -> any,
+	setBaseProperty: (character: Character, property: string, value: any) -> (),
+	setCustomHandler: (character: Character, property: string, handler: (character: Character, value: any) -> ()) -> (),
+	removeCustomHandler: (character: Character, property: string) -> (),
 
-	---
-	-- Clears all status effects from a character without removing the character.
-	-- @param character The character model.
-	--
-	clearAllStatuses: (character: Model, timestamp: number?) -> (),
+	-- System
+	advanceState: (deltaTime: number?) -> (),
 
-	---
-	-- Gets the remaining duration of a status effect.
-	-- @param character The character model.
-	-- @param statusName The identifier of the status.
-	-- @return Remaining time in seconds, or nil if status not found.
-	--
-	getRemainingDuration: (character: Model, statusName: string) -> number?,
+	-- Events
+	BindToStatusAdded: (callback: (character: Character, statusName: string, statusInfo: StatusInfo) -> ()) -> disconnect,
+	BindToStatusRemoved: (callback: (character: Character, statusName: string, removed: boolean) -> ()) -> disconnect,
+	BindToStatusChanged: (
+		callback: (character: Character, statusName: string, oldStatusInfo: StatusInfo, newStatusInfo: StatusInfo) -> ()
+	) -> disconnect,
 
-	---
-	-- Extends or reduces the duration of an existing status effect.
-	-- @param character The character model.
-	-- @param statusName The identifier of the status.
-	-- @param additionalTime Time to add (positive) or subtract (negative).
-	--
-	modifyDuration: (character: Model, statusName: string, additionalTime: number) -> (),
+	-- Enums
+	StackType: { [ExposedStackType]: number },
+	ApplyType: { [ExposedApplyType]: number },
 
-	---
-	-- Advances the state of all active statuses.
-	-- This function is called on each heartbeat to manage durations and cleanup.
-	--
-	advanceState: () -> (),
+	-- Config
+	config: configModule?,
 }
 
 --// Constants \\--
 
 local IS_SERVER = RunService:IsServer()
 
-local ALLOWED_PROPERTIES: { [validProperty]: string } = {
-	WalkSpeed = "number",
-	JumpPower = "number",
-	JumpHeight = "number",
-	MaxHealth = "number",
+local STACK_TYPE_SET = 0
+local STACK_TYPE_ADD = 1
+local STACK_TYPE_MULTIPLY = 2
+
+-- Enum values
+local STACK_TYPE_ENUM: { [ExposedStackType]: number } = {
+	Set = STACK_TYPE_SET,
+	Add = STACK_TYPE_ADD,
+	Multiply = STACK_TYPE_MULTIPLY,
+}
+
+local APPLY_TYPE_SET = 0
+local APPLY_TYPE_STACK = 1
+
+local APPLY_TYPE_ENUM: { [ExposedApplyType]: number } = {
+	Set = APPLY_TYPE_SET,
+	Stack = APPLY_TYPE_STACK,
 }
 
 -- Valid stack types
-local VALID_STACK_TYPES: { [stackType]: boolean } = {
-	Set = true,
-	Add = true,
-	Multiply = true,
+local VALID_STACK_TYPES: { [StackType]: boolean } = {}
+local VALID_APPLY_TYPES: { [ApplyType]: boolean } = {}
+
+for stackType, value in STACK_TYPE_ENUM do
+	VALID_STACK_TYPES[stackType] = true
+	VALID_STACK_TYPES[value] = true
+end
+
+for applyType, value in APPLY_TYPE_ENUM do
+	VALID_APPLY_TYPES[applyType] = true
+	VALID_APPLY_TYPES[value] = true
+end
+
+local DEFAULT_DURATION = math.huge
+local DEFAULT_STACK_TYPE: InternalStackType = 0 -- "Set" as default stack type
+local DEFAULT_APPLY_TYPE: InternalApplyType = 0 -- "Set" as default apply type
+local DEFAULT_PRIORITY = 0
+local DEFAULT_STACK_COUNT = 1
+
+local DEFAULT_CONFIG: configModule = {
+	DefaultProperties = {},
+	DefaultHandler = {},
+	SyncBehaviour = "SyncOwnerOnly",
 }
 
-local DEFAULT_DURATION = math.huge -- Default duration for statuses if not specified
-local DEFAULT_STACK_TYPE: "Set" = "Set" -- Default stack type for properties
-local DEFAULT_PRIORITY = 0 -- Default priority for statuses if not specified
+local CLIENT_SYNC_REMOTE_NAME = "STATUS_HANDLER_ClientSync"
+local INIT_REQUEST_REMOTE_NAME = "STATUS_HANDLER_InitRequest"
+local EVENT_FOLDER_NAME = "STATUS_HANDLER_EventFolder"
+local SYNC_FOLDER_NAME = "STATUS_HANDLER_SyncFolder"
 
-local SYNC_REMOTE_NAME = "STATUS_HANDLER_StatusSync" -- Remote event name for syncing status changes
-local SYNC_REQUEST_REMOTE_NAME = "STATUS_HANDLER_SyncRequest" -- Remote event name for sync requests
-local STATUS_SYNC_REMOTE = if IS_SERVER
-	then ReplicatedStorage:FindFirstChild(SYNC_REMOTE_NAME) :: RemoteEvent
-	else ReplicatedStorage:WaitForChild(SYNC_REMOTE_NAME) :: RemoteEvent
-local SYNC_REQUEST_REMOTE = if IS_SERVER
-	then ReplicatedStorage:FindFirstChild(SYNC_REQUEST_REMOTE_NAME) :: RemoteFunction
-	else ReplicatedStorage:WaitForChild(SYNC_REQUEST_REMOTE_NAME) :: RemoteFunction
+-- Remote setup
+local STATUS_SYNC_REMOTE: RemoteEvent
+local SYNC_REQUEST_REMOTE: RemoteFunction
+local EVENT_FOLDER: Folder
+local SYNC_FOLDER: Folder
 
-local SYNC_ALL_CHARACTERS = false -- Whether to sync all characters to client
+local REQUEST_DEFAULT_PROPERTIES = string.char(32)
+local REQUEST_INIT_DATA = string.char(33)
 
-if not STATUS_SYNC_REMOTE then
-	local newRemote = Instance.new("RemoteEvent", ReplicatedStorage)
-	newRemote.Name = SYNC_REMOTE_NAME
+if IS_SERVER then
+	EVENT_FOLDER = ReplicatedStorage:FindFirstChild(EVENT_FOLDER_NAME) :: Folder? or Instance.new("Folder")
+	assert(EVENT_FOLDER:IsA("Folder"), "EVENT_FOLDER must be a Folder")
+	EVENT_FOLDER.Name = EVENT_FOLDER_NAME
+	EVENT_FOLDER.Parent = ReplicatedStorage
 
-	STATUS_SYNC_REMOTE = newRemote
+	STATUS_SYNC_REMOTE = EVENT_FOLDER:FindFirstChild(CLIENT_SYNC_REMOTE_NAME) :: RemoteEvent? or Instance.new("RemoteEvent")
+	assert(STATUS_SYNC_REMOTE:IsA("RemoteEvent"), "STATUS_SYNC_REMOTE must be a RemoteEvent")
+	STATUS_SYNC_REMOTE.Name = CLIENT_SYNC_REMOTE_NAME
+	STATUS_SYNC_REMOTE.Parent = EVENT_FOLDER
+
+	SYNC_REQUEST_REMOTE = EVENT_FOLDER:FindFirstChild(INIT_REQUEST_REMOTE_NAME) :: RemoteFunction?
+		or Instance.new("RemoteFunction")
+	assert(SYNC_REQUEST_REMOTE:IsA("RemoteFunction"), "SYNC_REQUEST_REMOTE must be a RemoteFunction")
+	SYNC_REQUEST_REMOTE.Name = INIT_REQUEST_REMOTE_NAME
+	SYNC_REQUEST_REMOTE.Parent = EVENT_FOLDER
+
+	SYNC_FOLDER = ReplicatedStorage:FindFirstChild(SYNC_FOLDER_NAME) :: Folder? or Instance.new("Folder")
+	assert(SYNC_FOLDER:IsA("Folder"), "SYNC_FOLDER must be a Folder")
+	SYNC_FOLDER.Name = SYNC_FOLDER_NAME
+	SYNC_FOLDER.Parent = ReplicatedStorage
+else
+	EVENT_FOLDER = ReplicatedStorage:WaitForChild(EVENT_FOLDER_NAME) :: Folder
+	assert(EVENT_FOLDER:IsA("Folder"), "EVENT_FOLDER must be a Folder")
+
+	STATUS_SYNC_REMOTE = EVENT_FOLDER:WaitForChild(CLIENT_SYNC_REMOTE_NAME) :: RemoteEvent
+	assert(STATUS_SYNC_REMOTE:IsA("RemoteEvent"), "STATUS_SYNC_REMOTE must be a RemoteEvent")
+	SYNC_REQUEST_REMOTE = EVENT_FOLDER:WaitForChild(INIT_REQUEST_REMOTE_NAME) :: RemoteFunction
+	assert(SYNC_REQUEST_REMOTE:IsA("RemoteFunction"), "SYNC_REQUEST_REMOTE must be a RemoteFunction")
+	SYNC_FOLDER = ReplicatedStorage:WaitForChild(SYNC_FOLDER_NAME) :: Folder
+	assert(SYNC_FOLDER:IsA("Folder"), "SYNC_FOLDER must be a Folder")
 end
-
-if not SYNC_REQUEST_REMOTE then
-	local newRemote = Instance.new("RemoteFunction", ReplicatedStorage)
-	newRemote.Name = SYNC_REQUEST_REMOTE_NAME
-
-	SYNC_REQUEST_REMOTE = newRemote
-end
-
-assert(STATUS_SYNC_REMOTE and STATUS_SYNC_REMOTE:IsA("RemoteEvent"), "STATUS_SYNC_REMOTE must be a RemoteEvent")
-assert(SYNC_REQUEST_REMOTE and SYNC_REQUEST_REMOTE:IsA("RemoteFunction"), "SYNC_REQUEST_REMOTE must be a RemoteFunction")
 
 --// Variables \\--
 
-local activeStatuses: { [Model]: { [string]: ActiveStatus } } = {}
-local defaultProperties: { [Model]: { [validProperty]: any } } = {}
-local characterList: { [Model]: RBXScriptConnection } = {}
+local characterDataList: { [Model]: CharacterData } = {}
 
-do
-	local tempHumanoid: any = Instance.new("Humanoid")
-	local function index(obj: any, key: string)
-		return obj[key]
-	end
-
-	for propertyName, valueType in ALLOWED_PROPERTIES do
-		local success, value = pcall(index, tempHumanoid, propertyName)
-		if success then
-			if type(value) ~= valueType then
-				warn(`StatusModule: Property '{propertyName}' must be of type '{valueType}', but got '{type(value)}'.`)
-			end
-		else
-			warn(`StatusModule: Invalid property '{propertyName}' for Humanoid. Error: {value}`)
-		end
-	end
-	tempHumanoid:Destroy()
-end
+local statusCallbacks: { [string]: { <T...>(T...) -> () } } = {
+	OnStatusAdded = {},
+	OnStatusRemoved = {},
+	OnStatusChanged = {},
+}
 
 --// Module \\--
 
 local StatusModule = {} :: StatusModule
 
---// Sync Functions \\--
+--// Utility Functions \\--
 
--- For future bandwidth optimization, we can use these functions to serialize and deserialize sync data.
-local function writeSyncData(syncData: SyncData): any
-	return syncData
-end
-
-local function readSyncData(data: any): SyncData
-	return data
-end
-
-local function writeSyncRequestData(syncRequestData: SyncRequestData | { [Model]: SyncRequestData }): any
-	return syncRequestData
-end
-
-local function readSyncRequestData(data: any): { [Model]: SyncRequestData } | SyncRequestData
-	return data
-end
-
-local function syncStatusChange(syncData: SyncData, targetPlayer: Player?)
-	assert(IS_SERVER, "syncStatusChange can only be called from the server")
-
-	if not syncData or not syncData.Character then
-		warn("StatusModule: Cannot sync status change - invalid sync data provided.")
-		return
-	end
-
-	if targetPlayer then
-		STATUS_SYNC_REMOTE:FireClient(targetPlayer, writeSyncData(syncData))
-	elseif SYNC_ALL_CHARACTERS then
-		STATUS_SYNC_REMOTE:FireAllClients(writeSyncData(syncData))
-	else
-		local player = Players:GetPlayerFromCharacter(syncData.Character)
-		if player then
-			STATUS_SYNC_REMOTE:FireClient(player, writeSyncData(syncData))
-		else
-			warn(
-				`StatusModule: Cannot sync status change for character '{syncData.Character.Name}' - no associated player found.`
-			)
-		end
-	end
-end
-
---// Private Functions \\--
-
----
--- The core logic function. Recalculates all properties for a character based on
--- all active statuses and their stacking rules.
--- @param character The character model to update.
---
-local function updateCharacter(character: Model)
-	local humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid?
-	if not humanoid then
-		warn(`StatusModule: Cannot update character '{character.Name}' - no Humanoid found.`)
-		return
-	end
-	if not defaultProperties[character] then
-		warn(`StatusModule: Cannot update character '{character.Name}' - no default properties found. Call initCharacter first.`)
-		return
-	end
-
-	local statuses = activeStatuses[character]
-
-	-- If no statuses are active, revert to default properties.
-	if not statuses or next(statuses) == nil then
-		for property, value in defaultProperties[character] do
-			(humanoid :: any)[property] = value
-		end
-		return
-	end
-	-- This table will hold the final calculated values for each property.
-	-- Stacking is resolved by sorting effects by priority and timestamp; "Set" overrides all, otherwise "Add" and "Multiply" stack.
-	local finalProperties: { [validProperty]: any } = {}
-
-	-- Iterate through each property this module can control.
-	for propName in ALLOWED_PROPERTIES do
-		local baseValue = defaultProperties[character][propName]
-		if baseValue == nil then continue end
-
-		-- 1. Gather all active effects for the current property.
-		local effectsForProp: { EffectData } = {}
-		for statusName, status in statuses do
-			if status.Properties[propName] then
-				local effect = status.Properties[propName]
-				if effect.Value == nil or not effect.StackType then
-					warn(
-						`StatusModule: Invalid effect data for property '{propName}' in status '{statusName}' on character '{character.Name}' - skipping.`
-					)
-					continue
-				end
-				table.insert(effectsForProp, {
-					Priority = status.Priority,
-					Timestamp = status.Timestamp,
-					StackType = effect.StackType,
-					Value = effect.Value,
-				})
-			end
-		end
-
-		-- If there are no effects for this property, it remains at its base value.
-		if #effectsForProp == 0 then
-			finalProperties[propName] = baseValue
-			continue
-		end
-
-		-- 2. Sort the effects by priority (and timestamp as a tie-breaker).
-		table.sort(effectsForProp, function(a: EffectData, b: EffectData)
-			if a.Priority ~= b.Priority then
-				return a.Priority > b.Priority
-			else
-				return a.Timestamp < b.Timestamp
-			end
-		end)
-
-		-- 3. Determine the final value based on the highest priority effect's type.
-		local dominantEffect = effectsForProp[1]
-
-		if dominantEffect.StackType == "Set" then
-			-- If the highest priority effect is "Set", it wins. No stacking needed.
-			finalProperties[propName] = dominantEffect.Value
-		else
-			-- If the highest priority is "Add" or "Multiply", we stack all of them.
-			-- Any lower-priority "Set" effects are ignored.
-			local totalAddition = 0
-			local totalMultiplier = 1
-
-			for _, effect in effectsForProp do
-				if effect.StackType == "Add" then
-					totalAddition = totalAddition + effect.Value
-				elseif effect.StackType == "Multiply" then
-					totalMultiplier = totalMultiplier + (effect.Value - 1)
-				elseif effect.StackType == "Set" then
-					-- We explicitly ignore "Set" types here because we know the dominant
-					-- effect is not "Set", so any "Set" found must be of lower priority.
-				else
-					warn(
-						`StatusModule: Unknown StackType '{effect.StackType}' found while calculating '{propName}' for character '{character.Name}' - ignoring.`
-					)
-				end
-			end
-
-			finalProperties[propName] = (baseValue * totalMultiplier) + totalAddition
-		end
-	end
-	-- 4. Apply all the calculated final properties to the humanoid.
-	for propName, value in finalProperties do
-		local success = pcall(function()
-			(humanoid :: any)[propName] = value
-		end)
-		if not success then
-			warn(`StatusModule: Failed to set property '{propName}' to {value} on character '{character.Name}'`)
-		end
-	end
-end
-
----
--- Gets the current time in seconds since the epoch.
--- @return The current time in seconds.
 local function getTime(): number
 	return DateTime.now().UnixTimestampMillis / 1000
 end
 
---// Public Functions \\--
+local function getConfig(): configModule
+	return StatusModule.config or DEFAULT_CONFIG
+end
 
-function StatusModule.apply(character: Model, statusName: string, statusInfo: StatusInfo)
-	if not character or not character:IsA("Model") then
+local function getCharacterData(character: Character): CharacterData?
+	return characterDataList[character]
+end
+
+local function ensureCharacterData(character: Character): CharacterData
+	if not characterDataList[character] then StatusModule.initCharacter(character) end
+	return characterDataList[character]
+end
+
+local findStatus = (
+	function(character: Character, statusName: string)
+		local characterData = getCharacterData(character)
+		if not characterData then
+			warn(`StatusModule: Cannot find status '{statusName}' - character data not initialized for '{character.Name}'.`)
+			return nil
+		end
+
+		for i, status in characterData.ActiveStatuses do
+			if status.StatusName == statusName then return i :: any, status end
+		end
+
+		return nil
+	end
+) :: ((character: Character, statusName: string) -> (number, ActiveStatus)) & ((character: Character, statusName: string) -> nil)
+
+--// Config System \\--
+
+local function getDefaultProperties(): { [string]: any }
+	return getConfig().DefaultProperties or {}
+end
+
+--// Property Application \\--
+
+local function indexObject(object: any, index: any): any
+	return object[index]
+end
+
+local function safeGetObjectProperty(object: any, propertyName: string): (boolean, any)
+	if getConfig().AllowAttributesAsProperties then
+		local value = object:GetAttribute(propertyName)
+		if value ~= nil then return true, value end
+	end
+	return pcall(indexObject, object, propertyName)
+end
+
+local function setObjectIndex(object: any, index: any, value: any): ()
+	object[index] = value
+end
+
+local function safeSetObjectProperty(object: any, propertyName: string, value: any): (boolean, any)
+	if getConfig().AllowAttributesAsProperties and object:GetAttribute(propertyName) ~= nil then
+		object:SetAttribute(propertyName, value)
+		return true
+	end
+	return pcall(setObjectIndex, object, propertyName, value)
+end
+
+local function applyPropertyToCharacter(character: Character, property: string, value: any): ()
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot apply property '{property}' to character '{character.Name}' - character data not initialized.`)
+		return
+	end
+
+	-- Check for custom handler
+	if characterData.CustomHandlers[property] then
+		characterData.CustomHandlers[property](character, property, value)
+		return
+	end
+
+	-- Default humanoid property handling
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		warn(`StatusModule: Cannot apply property '{property}' to character '{character.Name}' - no Humanoid found.`)
+		return
+	end
+
+	local success, result = safeSetObjectProperty(humanoid, property, value)
+	if not success then
+		warn(`StatusModule: Failed to set property '{property}' to {value} on character '{character.Name}': {result}`)
+		return
+	end
+end
+
+--// Sync Functions \\--
+
+local currentId = 0
+
+local function createSyncObject(character: Character): (ObjectValue, number)
+	local characterId = currentId
+
+	local syncObject = Instance.new("ObjectValue")
+	syncObject.Name = tostring(characterId)
+	syncObject.Value = character
+	syncObject.Parent = SYNC_FOLDER
+
+	currentId = currentId + 1
+	return syncObject, characterId
+end
+
+local function writeSyncData(syncData: ClientSyncData): syncPacket
+	return syncData :: any -- temporary
+end
+
+local function readSyncData(syncPacket: syncPacket): ClientSyncData
+	return syncPacket :: any -- temporary
+end
+
+local function writeSyncRequestData(syncData: { initCharacterData }): syncPacket
+	return syncData :: any -- temporary
+end
+
+local function readSyncRequestData(syncPacket: syncPacket): { initCharacterData }
+	return syncPacket :: any -- temporary
+end
+
+local function syncStatusChange(syncData: ClientSyncData, targetPlayer: Player?)
+	if not IS_SERVER then return end
+
+	if targetPlayer then
+		STATUS_SYNC_REMOTE:FireClient(targetPlayer, writeSyncData(syncData))
+	else
+		STATUS_SYNC_REMOTE:FireAllClients(writeSyncData(syncData))
+	end
+end
+
+local function getCharacterFromSyncId(characterId: number): Character
+	print(`getCharacterFromSyncId: {characterId}`)
+	local syncObject = SYNC_FOLDER:WaitForChild(tostring(characterId)) :: ObjectValue
+	local character = syncObject.Value or syncObject.Changed:Wait() :: Instance
+	print(`getCharacterFromSyncId: Found character '{character.Name}' for ID '{characterId}'`)
+	return character :: Character
+end
+
+--// Core Logic \\--
+
+local function updateCharacter(character: Character): ()
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot update character '{character.Name}' - character data not initialized.`)
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		warn(`StatusModule: Cannot update character '{character.Name}' - no Humanoid found.`)
+		return
+	end
+
+	local statuses = characterData.ActiveStatuses
+
+	-- If no statuses are active, revert to default properties
+	if next(statuses) == nil then
+		for property, value in characterData.DefaultProperties do
+			applyPropertyToCharacter(character, property, value)
+		end
+		return
+	end
+
+	local baseProperties = characterData.DefaultProperties
+	local processingProperties: { [string]: any } = table.clone(baseProperties)
+	local setProperties: { [string]: any } = {}
+
+	-- Statuses are already sorted on insertion, so we can process them in order
+	for _, status in statuses do
+		if status.Paused then continue end
+
+		-- Gather all properties for this status
+		for property, effect in status.Properties do
+			if setProperties[property] ~= nil then continue end -- Property already finalized
+
+			local stackType = effect.StackType
+			local currentValue = processingProperties[property]
+			if not currentValue then
+				warn(
+					`StatusModule: Property '{property}' not found in character '{character.Name}' default properties. Attempting to retrieve from Humanoid as fallback.`
+				)
+				local success, value = safeGetObjectProperty(humanoid, property)
+				if not success then
+					warn(`StatusModule: Failed to get property '{property}' from character '{character.Name}': {value}`)
+					continue
+				end
+
+				baseProperties[property] = value
+				processingProperties[property] = value
+				currentValue = value
+			end
+
+			if stackType == STACK_TYPE_SET then
+				setProperties[property] = effect.Value
+			elseif stackType == STACK_TYPE_ADD then
+				local success, result = pcall(function()
+					processingProperties[property] = currentValue + effect.Value
+					return nil
+				end)
+				if not success then
+					warn(`StatusModule: Failed to add value to property '{property}' on character '{character.Name}': {result}`)
+					continue
+				end
+			else -- STACK_TYPE_MULTIPLY
+				local success, result = pcall(function()
+					processingProperties[property] = currentValue + baseProperties[property] * (effect.Value - 1)
+					return nil
+				end)
+				if not success then
+					warn(
+						`StatusModule: Failed to multiply value for property '{property}' on character '{character.Name}': {result}`
+					)
+					continue
+				end
+			end
+		end
+	end
+
+	-- Apply all calculated properties
+	for property, value in setProperties do
+		applyPropertyToCharacter(character, property, value)
+	end
+
+	-- Apply any remaining processing properties
+	for property, value in processingProperties do
+		applyPropertyToCharacter(character, property, value)
+	end
+end
+
+local function initCharacter(character: Model, defaultProperties: { [string]: any }?, sync: boolean?): ()
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot initialize character - invalid character model provided.")
+		return
+	end
+
+	if characterDataList[character] then return end
+
+	if defaultProperties ~= nil then
+		if type(defaultProperties) ~= "table" then
+			warn("StatusModule: Cannot initialize character - defaultProperties must be a table.")
+			return
+		else
+			for property in defaultProperties do
+				if type(property) ~= "string" then
+					warn(
+						`StatusModule: Invalid property '{property}' in defaultProperties for character '{character.Name}'. Must be a string.`
+					)
+					return
+				end
+			end
+		end
+	elseif not IS_SERVER then
+		error("cannot init character from client, not implemented yet")
+		-- defaultProperties = SYNC_REQUEST_REMOTE:InvokeServer(REQUEST_DEFAULT_PROPERTIES, character)
+	end
+
+	local properties = defaultProperties :: { [string]: any } or getDefaultProperties()
+
+	local characterData = {
+		Id = 0,
+		OwnedPlayer = Players:GetPlayerFromCharacter(character),
+		ActiveStatuses = {},
+		DefaultProperties = properties,
+		CustomHandlers = {},
+		Connection = character.AncestryChanged:Connect(function()
+			if not character:IsDescendantOf(game) then StatusModule.removeCharacter(character) end
+		end),
+	}
+
+	characterDataList[character] = characterData :: CharacterData
+
+	if IS_SERVER and sync ~= false then
+		-- Create sync object for replication
+		local _, id = createSyncObject(character)
+		characterData.Id = id
+
+		syncStatusChange({
+			Action = "init" :: "init",
+			Character = character,
+			DefaultProperties = properties,
+			CharacterId = id,
+			Timestamp = getTime(),
+		})
+	end
+end
+
+--// Public API \\--
+
+function StatusModule.apply(character: Character, statusName: string, statusInfo: StatusInfo, applyType: ApplyType?): ()
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
 		warn("StatusModule: Cannot apply status - invalid character model provided.")
 		return
 	end
 
-	if not statusName then
-		warn("StatusModule: Cannot apply status - statusName cannot be nil.")
+	if not statusName or statusName == "" then
+		warn("StatusModule: Cannot apply status - statusName cannot be nil or empty.")
 		return
 	end
 
@@ -496,670 +703,1091 @@ function StatusModule.apply(character: Model, statusName: string, statusInfo: St
 		return
 	end
 
-	local humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid?
-	if not humanoid then
-		warn(`StatusModule: Cannot apply status '{statusName}' to character '{character.Name}' - no Humanoid found.`)
+	if type(applyType) == "number" then
+		if not VALID_APPLY_TYPES[applyType] then
+			warn(`StatusModule: Invalid apply type '{applyType}' for status '{statusName}'.`)
+			return
+		end
+	elseif type(applyType) == "string" then
+		local normalized = APPLY_TYPE_ENUM[applyType]
+		if not normalized then
+			warn(`StatusModule: Invalid apply type '{applyType}' for status '{statusName}'.`)
+			return
+		end
+		applyType = normalized
+	elseif applyType ~= nil then
+		warn(`StatusModule: Invalid apply type '{applyType}' for status '{statusName}'. Using default apply type.`)
+		return
+	else
+		applyType = DEFAULT_APPLY_TYPE
+	end
+
+	local characterData = ensureCharacterData(character)
+	local statuses = characterData.ActiveStatuses
+
+	local duration = statusInfo.Duration or DEFAULT_DURATION
+	if duration < 0 then
+		warn(`StatusModule: Cannot apply status '{statusName}' - Duration cannot be negative.`)
 		return
 	end
 
-	if not defaultProperties[character] then StatusModule.initCharacter(character) end
-	if not activeStatuses[character] then activeStatuses[character] = {} end
+	local sanitizedStatusInfo: SanitizedStatusInfo = table.clone(statusInfo) :: any
+	sanitizedStatusInfo.Duration = duration
 
-	local duration = statusInfo.Duration
-	if duration and duration < 0 then
-		warn(`StatusModule: Cannot apply status '{statusName}' to character '{character.Name}' - Duration cannot be negative.`)
-		return
+	if statusInfo.RemainingDuration ~= nil then
+		if type(statusInfo.RemainingDuration) ~= "number" or statusInfo.RemainingDuration < 0 then
+			warn(
+				`StatusModule: Invalid RemainingDuration '{statusInfo.RemainingDuration}' for status '{statusName}'. Using Duration.`
+			)
+			sanitizedStatusInfo.RemainingDuration = duration
+		else
+			sanitizedStatusInfo.RemainingDuration = statusInfo.RemainingDuration
+		end
+	else
+		sanitizedStatusInfo.RemainingDuration = duration
 	end
 
-	-- Sanitize and validate the properties being applied.
-	local sanitizedProperties: { [validProperty]: PropertyEffect } = {}
+	-- Normalize and validate properties
+	local sanitizedProperties: { [string]: InternalPropertyEffect } = {}
 	if statusInfo.Properties then
 		for propName, propInfo in statusInfo.Properties do
-			local propertyType = ALLOWED_PROPERTIES[propName]
-			if not propertyType then
-				warn(
-					`StatusModule: Invalid property '{propName}' in statusInfo.Properties for status '{statusName}' on character '{character.Name}' - ignoring.`
-				)
-				continue
-			end
-
 			if type(propInfo) ~= "table" then
-				warn(
-					`StatusModule: Property '{propName}' in statusInfo.Properties for status '{statusName}' on character '{character.Name}' must be a table - ignoring.`
-				)
+				warn(`StatusModule: Invalid property '{propName}' for status '{statusName}' - must be a table.`)
 				continue
 			end
 
-			local value = propInfo.Value
-			if type(value) ~= propertyType then
-				warn(
-					`StatusModule: Property '{propName}' value in status '{statusName}' on character '{character.Name}' must be a {propertyType}, got {type(
-						value
-					)} - ignoring.`
-				)
-				continue
+			local stackType = propInfo.StackType or DEFAULT_STACK_TYPE
+			if type(stackType) == "number" then
+				if not VALID_STACK_TYPES[stackType] then stackType = nil end
+			elseif type(stackType) == "string" then
+				stackType = STACK_TYPE_ENUM[stackType]
 			end
 
-			local stackType: stackType = propInfo.StackType or DEFAULT_STACK_TYPE
-			local validStackType = VALID_STACK_TYPES[stackType]
-
-			if not validStackType then
+			if not stackType then
 				warn(
-					`StatusModule: Invalid StackType '{stackType}' for property '{propName}' in status '{statusName}' on character '{character.Name}' - ignoring.`
+					`StatusModule: Invalid stack type '{stackType}' for property '{propName}' in status '{statusName}'. Using default stack type.`
 				)
-				continue
 			end
 
 			sanitizedProperties[propName] = {
-				Value = value,
-				StackType = stackType :: stackType,
+				Value = propInfo.Value,
+				StackType = stackType :: number? or DEFAULT_STACK_TYPE,
 			}
 		end
-	else
-		warn(
-			`StatusModule: No properties specified for status '{statusName}' on character '{character.Name}' - status will have no effect.`
-		)
 	end
 
-	local callback = statusInfo.Callback
-	if callback and type(callback) ~= "function" then
-		warn(`StatusModule: Callback for status '{statusName}' on character '{character.Name}' must be a function - ignoring.`)
-		callback = nil
+	sanitizedStatusInfo.Properties = sanitizedProperties
+
+	local priority = statusInfo.Priority
+	if priority ~= nil and (type(priority) ~= "number" or priority ~= priority) then
+		warn(`StatusModule: Invalid priority '{priority}' for status '{statusName}'. Using default priority.`)
+		priority = nil
 	end
 
-	local existingStatus: ActiveStatus? = activeStatuses[character][statusName]
-	local timestamp = statusInfo.Timestamp or getTime()
+	sanitizedStatusInfo.Priority = priority or DEFAULT_PRIORITY
+
+	local timestamp = statusInfo.Timestamp
+	if timestamp ~= nil and (type(timestamp) ~= "number" or timestamp ~= timestamp) then
+		warn(`StatusModule: Invalid timestamp '{timestamp}' for status '{statusName}'. Using current time.`)
+		timestamp = nil
+	end
+
+	sanitizedStatusInfo.Timestamp = timestamp or getTime()
+
+	local tags = statusInfo.Tags
+	if tags ~= nil and type(tags) ~= "table" then
+		warn(`StatusModule: Invalid tags '{tags}' for status '{statusName}'. Using empty tags.`)
+	end
+
+	sanitizedStatusInfo.Tags = tags or {}
+
+	local stackCount = statusInfo.StackCount
+	if stackCount ~= nil and type(stackCount) ~= "number" then
+		warn(`StatusModule: Invalid stack count '{stackCount}' for status '{statusName}'. Using default stack count.`)
+		stackCount = nil
+	end
+
+	sanitizedStatusInfo.StackCount = stackCount or DEFAULT_STACK_COUNT
+
+	if statusInfo.OnRemove ~= nil and type(statusInfo.OnRemove) ~= "function" then
+		warn(`StatusModule: Invalid OnRemove callback for status '{statusName}'. Using nil.`)
+		sanitizedStatusInfo.OnRemove = nil
+	end
+
+	if statusInfo.OnTick ~= nil and type(statusInfo.OnTick) ~= "function" then
+		warn(`StatusModule: Invalid OnTick callback for status '{statusName}'. Using nil.`)
+		sanitizedStatusInfo.OnTick = nil
+	end
+
+	local currentTime = sanitizedStatusInfo.Timestamp
+
+	local _, existingStatus = findStatus(character, statusName)
+	local oldStatusInfo = nil
 
 	if existingStatus then
-		if existingStatus.Timestamp and existingStatus.Timestamp > timestamp then
-			warn(
-				`StatusModule: Attempted to apply older status '{statusName}' to character '{character.Name}' - ignoring (existing: {existingStatus.Timestamp}, new: {timestamp}).`
-			)
-			return
+		oldStatusInfo = {
+			Priority = existingStatus.Priority,
+			Duration = existingStatus.Duration,
+			Timestamp = existingStatus.Timestamp,
+			StackCount = existingStatus.StackCount,
+
+			Tags = table.clone(existingStatus.Tags),
+			Properties = table.clone(existingStatus.Properties),
+
+			OnRemove = existingStatus.OnRemove,
+			OnTick = existingStatus.OnTick,
+		}
+
+		if applyType == APPLY_TYPE_STACK then
+			-- Add to existing stack
+			existingStatus.StackCount = existingStatus.StackCount + sanitizedStatusInfo.StackCount
+			existingStatus.RemainingDuration = duration
+		else
+			if applyType ~= APPLY_TYPE_SET then
+				warn(`StatusModule: Invalid apply type '{applyType}' for status '{statusName}'. Using default apply type.`)
+			end
+			-- Replace existing status
+			existingStatus.Priority = priority or DEFAULT_PRIORITY
+			existingStatus.Duration = duration
+			existingStatus.RemainingDuration = duration
+			existingStatus.Properties = sanitizedProperties
+			existingStatus.Timestamp = currentTime
+			existingStatus.Tags = sanitizedStatusInfo.Tags
+			existingStatus.StackCount = sanitizedStatusInfo.StackCount
+			existingStatus.OnRemove = sanitizedStatusInfo.OnRemove
+			existingStatus.OnTick = sanitizedStatusInfo.OnTick
+		end
+	else
+		-- Create new status
+		local statusPriority = sanitizedStatusInfo.Priority
+		local inserted = false
+
+		local newStatus = {
+			StatusName = statusName,
+			Priority = statusPriority,
+			Duration = duration,
+			RemainingDuration = sanitizedStatusInfo.RemainingDuration,
+			Timestamp = currentTime,
+			StackCount = sanitizedStatusInfo.StackCount,
+
+			Paused = false,
+
+			Tags = sanitizedStatusInfo.Tags,
+			Properties = sanitizedProperties,
+
+			OnRemove = sanitizedStatusInfo.OnRemove,
+			OnTick = sanitizedStatusInfo.OnTick,
+		}
+
+		for i, status in statuses do
+			if status.Priority > statusPriority then continue end
+			if status.Priority == statusPriority and status.Timestamp < currentTime then
+				-- If same priority, keep the first applied one
+				continue
+			end
+			table.insert(statuses, i, newStatus)
+			inserted = true
+			break
 		end
 
-		-- Refresh existing status
-		existingStatus.Timestamp = timestamp
-		existingStatus.Duration = duration or existingStatus.Duration
-		existingStatus.Properties = sanitizedProperties
-		existingStatus.Priority = statusInfo.Priority or existingStatus.Priority
-	else
-		-- Add new status
-		activeStatuses[character][statusName] = {
-			Priority = statusInfo.Priority or DEFAULT_PRIORITY,
-			Duration = duration or DEFAULT_DURATION,
-			Properties = sanitizedProperties,
-			Timestamp = timestamp,
-			Callback = callback,
-		}
+		if not inserted then table.insert(statuses, newStatus) end
 	end
 
 	updateCharacter(character)
-	if not IS_SERVER then return end
 
-	syncStatusChange({
-		Character = character,
-		Timestamp = timestamp,
-		Action = "apply" :: "apply",
-		StatusName = statusName,
-		StatusInfo = statusInfo,
-	})
+	-- Fire events
+	if oldStatusInfo then
+		for _, callback in statusCallbacks.OnStatusChanged do
+			task.spawn(callback, character, statusName, oldStatusInfo, statusInfo)
+		end
+	else
+		for _, callback in statusCallbacks.OnStatusAdded do
+			task.spawn(callback, character, statusName, statusInfo)
+		end
+	end
+
+	if IS_SERVER then
+		syncStatusChange({
+			Action = "apply" :: "apply",
+			Character = character,
+			Timestamp = currentTime,
+			StatusName = statusName :: string,
+			StatusInfo = statusInfo,
+			ApplyType = applyType,
+		})
+	end
 end
 
-function StatusModule.remove(character: Model, statusName: string, timestamp: number?)
-	if not character or not character:IsA("Model") then
+function StatusModule.remove(character: Character, statusName: string, timestamp: number?)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
 		warn("StatusModule: Cannot remove status - invalid character model provided.")
 		return
 	end
 
-	if not statusName then
-		warn("StatusModule: Cannot remove status - statusName cannot be nil.")
+	if not statusName or statusName == "" then
+		warn("StatusModule: Cannot remove status - statusName cannot be nil or empty.")
 		return
 	end
 
-	if not activeStatuses[character] then
-		warn(`StatusModule: Cannot remove status '{statusName}' - character '{character.Name}' has no active statuses.`)
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot remove status '{statusName}' - character data not initialized for '{character.Name}'.`)
 		return
 	end
 
-	local statuses = activeStatuses[character]
-	local existingStatus = statuses[statusName]
+	local statuses = characterData.ActiveStatuses
+	local index, existingStatus = findStatus(character, statusName)
 
-	if not existingStatus then
-		warn(`StatusModule: Status '{statusName}' not found for character '{character.Name}'.`)
-		return
-	end
+	if not existingStatus then return end
 
 	if timestamp and existingStatus.Timestamp > timestamp then
-		warn(
-			`StatusModule: Attempted to remove older status '{statusName}' from character '{character.Name}' - ignoring (existing: {existingStatus.Timestamp}, remove: {timestamp}).`
-		)
-		return
+		return -- Ignore older remove requests
 	end
 
-	local callback = existingStatus.Callback
-	if callback then
-		-- Call the callback function with the character and removed status flag
-		task.spawn(pcall, callback, character, true)
-	end
+	table.remove(statuses, index)
 
-	statuses[statusName] = nil
+	local onRemove = existingStatus.OnRemove
+	if onRemove then task.spawn(onRemove, character, true) end
+
 	updateCharacter(character)
 
-	if not IS_SERVER then return end
+	for _, callback in statusCallbacks.OnStatusRemoved do
+		task.spawn(callback, character, statusName, true)
+	end
 
-	syncStatusChange({
-		Character = character,
-		Action = "remove" :: "remove",
-		StatusName = statusName,
-		Timestamp = getTime(),
-	})
+	if IS_SERVER then
+		syncStatusChange({
+			Action = "remove" :: "remove",
+			Character = character,
+			StatusName = statusName :: string,
+			Timestamp = getTime(),
+		})
+	end
 end
 
-function StatusModule.hasStatus(character: Model, statusName: string): boolean
-	if not character or not character:IsA("Model") then
+function StatusModule.hasStatus(character: Character, statusName: string): boolean
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
 		warn("StatusModule: Cannot check status - invalid character model provided.")
 		return false
 	end
 
-	if not statusName then
-		warn("StatusModule: Cannot check status - statusName cannot be nil.")
+	if type(statusName) ~= "string" or statusName == "" then
+		warn("StatusModule: Cannot check status - statusName must be a non-empty string.")
 		return false
 	end
 
-	if not activeStatuses[character] then return false end
-
-	local statuses = activeStatuses[character]
-	return statuses[statusName] ~= nil
+	return findStatus(character, statusName) ~= nil
 end
 
-function StatusModule.getActiveStatuses(character: Model): { string }
-	if not character or not character:IsA("Model") then
+function StatusModule.getActiveStatuses(character: Character): { string }
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
 		warn("StatusModule: Cannot get active statuses - invalid character model provided.")
 		return {}
 	end
 
-	if not activeStatuses[character] then return {} end
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot get active statuses - character data not initialized for '{character.Name}'.`)
+		return {}
+	end
 
-	local statusNames: { string } = {}
-	local statuses = activeStatuses[character]
-
-	for statusName in statuses do
-		table.insert(statusNames, statusName)
+	local statusNames = {}
+	for _, status in characterData.ActiveStatuses do
+		table.insert(statusNames, status.StatusName)
 	end
 
 	return statusNames
 end
 
-function StatusModule.getStatusInfo(character: Model, statusName: string): ReadOnlyStatus?
-	if not character or not character:IsA("Model") then
+function StatusModule.getStatusInfo(character: Character, statusName: string): StatusInfo?
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
 		warn("StatusModule: Cannot get status info - invalid character model provided.")
 		return nil
 	end
 
-	if not statusName then
-		warn("StatusModule: Cannot get status info - statusName cannot be nil.")
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot get status info - character data not initialized for '{character.Name}'.`)
 		return nil
 	end
 
-	if not activeStatuses[character] then return nil end
+	local _, status = findStatus(character, statusName)
+	if not status then return nil end
 
-	local statuses = activeStatuses[character]
-	local existingStatus = statuses[statusName]
-	if not existingStatus then return nil end
+	return {
+		Priority = status.Priority,
+		Duration = status.Duration,
+		Timestamp = status.Timestamp,
+		StackCount = status.StackCount,
 
-	return table.freeze({
-		Priority = existingStatus.Priority,
-		Duration = existingStatus.Duration,
-		Properties = table.freeze(table.clone(existingStatus.Properties)),
-		Timestamp = existingStatus.Timestamp,
-	})
+		Tags = table.clone(status.Tags),
+		Properties = table.clone(status.Properties) :: { [string]: PropertyEffect },
+
+		OnRemove = status.OnRemove,
+		OnTick = status.OnTick,
+	}
 end
 
-function StatusModule.clearAllStatuses(character: Model, timestamp: number?)
-	if not character or not character:IsA("Model") then
+function StatusModule.clearAllStatuses(character: Character, timestamp: number?)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
 		warn("StatusModule: Cannot clear statuses - invalid character model provided.")
 		return
 	end
 
-	if not activeStatuses[character] then
-		warn(`StatusModule: Cannot clear statuses - character '{character.Name}' has no active statuses.`)
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot clear statuses - character data not initialized for '{character.Name}'.`)
 		return
 	end
 
-	if timestamp then
-		local updated = false
-		for statusName, status in activeStatuses[character] do
-			if status.Timestamp > timestamp then continue end
-			activeStatuses[character][statusName] = nil
-			updated = true
-		end
+	local statuses = characterData.ActiveStatuses
+	local removedAny = false
 
-		if not updated then
-			warn(
-				`StatusModule: No statuses cleared for character '{character.Name}' - all existing statuses are newer than timestamp {timestamp}.`
-			)
-			return
+	if timestamp then
+		for i = #statuses, 1, -1 do
+			local status = statuses[i]
+			if status.Timestamp > timestamp then continue end
+			table.remove(statuses, i)
+			removedAny = true
+			for _, callback in statusCallbacks.OnStatusRemoved do
+				task.spawn(callback, character, status.StatusName, true)
+			end
 		end
 	else
-		table.clear(activeStatuses[character])
+		local clone = table.clone(statuses)
+		table.clear(statuses)
+
+		for _, status in clone do
+			local onRemove = status.OnRemove
+			if onRemove then task.spawn(onRemove, character, true) end
+			for _, callback in statusCallbacks.OnStatusRemoved do
+				task.spawn(callback, character, status.StatusName, true)
+			end
+		end
+
+		removedAny = true
 	end
 
-	updateCharacter(character)
+	if removedAny then
+		updateCharacter(character)
 
-	if not IS_SERVER then return end
-
-	syncStatusChange({
-		Character = character,
-		Action = "clear" :: "clear",
-		Timestamp = getTime(),
-	})
+		if IS_SERVER then
+			syncStatusChange({
+				Action = "clear" :: "clear",
+				Character = character,
+				Timestamp = timestamp or getTime(),
+			})
+		end
+	end
 end
 
-function StatusModule.getRemainingDuration(character: Model, statusName: string): number?
-	if not character or not character:IsA("Model") then
-		warn("StatusModule: Cannot get remaining duration - invalid character model provided.")
+function StatusModule.getRemainingDuration(character: Character, statusName: string): number?
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot modify duration - invalid character model provided.")
 		return nil
 	end
 
-	if not statusName then
-		warn("StatusModule: Cannot get remaining duration - statusName cannot be nil.")
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot modify duration - character data not initialized for '{character.Name}'.`)
 		return nil
 	end
 
-	if not activeStatuses[character] then return nil end
+	local _, status = findStatus(character, statusName)
+	if not status then return nil end
 
-	local statuses = activeStatuses[character]
-	local statusInfo = statuses[statusName]
-	if not statusInfo then return nil end
-
-	if statusInfo.Duration == math.huge then return math.huge end
-
-	local currentTime = getTime()
-	local elapsed = currentTime - statusInfo.Timestamp
-	local remaining = statusInfo.Duration - elapsed
-
-	-- Ensure we don't return negative durations
-	return math.max(0, remaining)
+	if status.Duration == math.huge then return math.huge end
+	return math.max(0, status.RemainingDuration)
 end
 
-function StatusModule.modifyDuration(character: Model, statusName: string, additionalTime: number)
-	if not character or not character:IsA("Model") then
+function StatusModule.modifyDuration(character: Character, statusName: string, newDuration: number)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
 		warn("StatusModule: Cannot modify duration - invalid character model provided.")
 		return
 	end
 
-	if not statusName then
-		warn("StatusModule: Cannot modify duration - statusName cannot be nil.")
-		return
-	end
-
-	if type(additionalTime) ~= "number" then
-		warn("StatusModule: Cannot modify duration - additionalTime must be a number.")
-		return
-	end
-
-	if not activeStatuses[character] then return end
-
-	local statuses = activeStatuses[character]
-	local statusInfo = statuses[statusName]
-
-	if not statusInfo then
-		warn(`StatusModule: Status '{statusName}' not found for character '{character.Name}'.`)
-		return
-	end
-
-	if statusInfo.Duration == math.huge then
-		warn(`StatusModule: Cannot modify duration for permanent status '{statusName}' on character '{character.Name}'.`)
-		return
-	end
-
-	statusInfo.Duration = math.max(0, statusInfo.Duration + additionalTime)
-
-	if statusInfo.Duration == 0 then
+	if type(newDuration) ~= "number" or newDuration < 0 then
 		warn(
-			`StatusModule: Duration modification resulted in 0 duration for status '{statusName}' on character '{character.Name}' - status will expire immediately.`
+			`StatusModule: Invalid new duration '{newDuration}' for status '{statusName}'. Duration must be a non-negative number.`
 		)
-	end
-
-	if not IS_SERVER then return end
-
-	syncStatusChange({
-		Character = character,
-		Action = "apply" :: "apply",
-		StatusName = statusName,
-		StatusInfo = {
-			Priority = statusInfo.Priority,
-			Duration = statusInfo.Duration,
-			Properties = statusInfo.Properties,
-		} :: StatusInfo,
-		Timestamp = getTime(),
-	})
-end
-
-function StatusModule.initCharacter(character: Model, default: { [validProperty]: any }?)
-	if not character or not character:IsA("Model") then
-		warn("StatusModule: initCharacter requires a valid Model.")
 		return
 	end
 
-	local humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid?
-	if not humanoid then
-		warn("StatusModule: Cannot initialize character without a Humanoid.")
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot modify duration - character data not initialized for '{character.Name}'.`)
 		return
 	end
 
-	if characterList[character] then
-		if default then
-			defaultProperties[character] = default
-		end
-		-- If already initialized, no need to reinitialize
+	local _, status = findStatus(character, statusName)
+	if not status then
+		warn(`StatusModule: Cannot modify duration - status '{statusName}' not found for character '{character.Name}'.`)
 		return
 	end
 
-	if default then
-		-- If default properties are provided, use them
-		defaultProperties[character] = default
-	else
-		-- Otherwise, initialize with current Humanoid properties
-		defaultProperties[character] = {}
-		for propertyName in ALLOWED_PROPERTIES do
-			local success, value = pcall(function()
-				return (humanoid :: any)[propertyName]
-			end)
-			if success then
-				defaultProperties[character][propertyName] = value
-			else
-				warn(`StatusModule: Failed to read property '{propertyName}' from character '{character.Name}' Humanoid.`)
-			end
-		end
-	end
+	local oldDuration = status.Duration
+	if oldDuration == newDuration then return end
 
-	activeStatuses[character] = {}
-
-	characterList[character] = character.AncestryChanged:Connect(function()
-		if not character:IsDescendantOf(game) then StatusModule.removeCharacter(character) end
-	end)
+	status.Duration = newDuration
+	status.RemainingDuration = status.Duration
 
 	if IS_SERVER then
-		-- Log successful initialization
-		local statusCount = 0
-		if activeStatuses[character] then
-			for _ in activeStatuses[character] do
-				statusCount = statusCount + 1
-			end
-		end
-		if statusCount == 0 then
-			print(`StatusModule: Successfully initialized character '{character.Name}' with default properties.`)
-		else
-			print(`StatusModule: Successfully initialized character '{character.Name}' with {statusCount} active statuses.`)
-		end
+		syncStatusChange({
+			Action = "modifyDuration" :: "modifyDuration",
+			Character = character,
+			StatusName = statusName :: string,
+			StatusInfo = status :: StatusInfo,
+			NewDuration = newDuration,
+			Timestamp = getTime(),
+		})
 	end
 end
 
-function StatusModule.removeCharacter(character: Model)
-	if not character or not character:IsA("Model") then
-		warn("StatusModule: removeCharacter requires a valid Model.")
+function StatusModule.pauseStatus(character: Character, statusName: string)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot pause status - invalid character model provided.")
 		return
 	end
 
-	if not characterList[character] then return end
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot pause status - character data not initialized for '{character.Name}'.`)
+		return
+	end
 
+	local _, status = findStatus(character, statusName)
+	if not status then
+		warn(`StatusModule: Cannot pause status - status '{statusName}' not found for character '{character.Name}'.`)
+		return
+	end
+
+	if status.Paused then return end
+	status.Paused = true
+	updateCharacter(character)
+
+	if IS_SERVER then
+		syncStatusChange({
+			Action = "pause" :: "pause",
+			Character = character,
+			StatusName = statusName :: string,
+			StatusInfo = status :: StatusInfo,
+			Timestamp = getTime(),
+		})
+	end
+end
+
+function StatusModule.resumeStatus(character: Character, statusName: string)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot resume status - invalid character model provided.")
+		return
+	end
+
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot resume status - character data not initialized for '{character.Name}'.`)
+		return
+	end
+
+	local _, status = findStatus(character, statusName)
+	if not status then
+		warn(`StatusModule: Cannot resume status - status '{statusName}' not found for character '{character.Name}'.`)
+		return
+	end
+
+	if not status.Paused then return end
+
+	status.Paused = false
+	updateCharacter(character)
+
+	if IS_SERVER then
+		syncStatusChange({
+			Action = "resume" :: "resume",
+			Character = character,
+			StatusName = statusName,
+			Timestamp = getTime(),
+		})
+	end
+end
+
+function StatusModule.pauseAllStatuses(character: Character)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot pause all statuses - invalid character model provided.")
+		return
+	end
+
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot pause all statuses - character data not initialized for '{character.Name}'.`)
+		return
+	end
+
+	for _, status in characterData.ActiveStatuses do
+		StatusModule.pauseStatus(character, status.StatusName)
+	end
+end
+
+function StatusModule.resumeAllStatuses(character: Character)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot resume all statuses - invalid character model provided.")
+		return
+	end
+
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot resume all statuses - character data not initialized for '{character.Name}'.`)
+		return
+	end
+
+	for _, status in characterData.ActiveStatuses do
+		StatusModule.resumeStatus(character, status.StatusName)
+	end
+end
+
+StatusModule.initCharacter = initCharacter :: any
+
+function StatusModule.removeCharacter(character: Character)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot remove character - invalid character model provided.")
+		return
+	end
+
+	local characterData = characterDataList[character]
+	if not characterData then return end
+
+	-- Reset properties if character still exists
 	if character.Parent then
-		-- Reset all properties to their defaults
-		local humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid?
-		if humanoid and defaultProperties[character] then
-			for propertyName, value in defaultProperties[character] do
-				local success = pcall(function()
-					(humanoid :: any)[propertyName] = value
-				end)
-				if not success then
-					warn(
-						`StatusModule: Failed to reset property '{propertyName}' to default value on character '{character.Name}' during cleanup.`
-					)
-				end
-			end
-		else
-			if not humanoid then
-				warn(`StatusModule: No Humanoid found for character '{character.Name}' during cleanup - cannot reset properties.`)
-			end
+		for property, value in characterData.DefaultProperties do
+			applyPropertyToCharacter(character, property, value)
 		end
 	end
 
-	-- Clear all active statuses for this character
-	activeStatuses[character] = nil
-	defaultProperties[character] = nil
+	-- Clean up connections
+	if characterData.Connection then characterData.Connection:Disconnect() end
+	local syncObject = SYNC_FOLDER:FindFirstChild(tostring(characterData.Id))
+	if syncObject then syncObject:Destroy() end
 
-	-- Disconnect the AncestryChanged event if it exists
-	if characterList[character] then
-		characterList[character]:Disconnect()
-		characterList[character] = nil
-	end
+	characterDataList[character] = nil
 end
 
-function StatusModule.advanceState()
-	local currentTime = getTime()
-	local expiredCount = 0
-
-	for character, statuses in activeStatuses do
-		local needsUpdate = false
-		for statusName, status in statuses do
-			if currentTime - status.Timestamp < status.Duration then continue end
-
-			local callback = status.Callback
-			if callback then
-				-- Call the callback function with the character and removed status flag
-				task.spawn(pcall, callback, character, false)
-			end
-
-			-- Remove expired status
-			statuses[statusName] = nil
-			needsUpdate = true
-			expiredCount = expiredCount + 1
-
-			if IS_SERVER then
-				syncStatusChange({
-					Character = character,
-					Action = "remove" :: "remove",
-					StatusName = statusName,
-					Timestamp = currentTime,
-				})
-			end
-		end
-
-		if needsUpdate then updateCharacter(character) end
+function StatusModule.getStatusesByTag(character: Character, tag: string): { string }
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot get statuses by tag - invalid character model provided.")
+		return {}
 	end
 
-	-- Optional: Log expired statuses periodically (only on server to reduce spam)
-	if IS_SERVER and expiredCount > 0 then print(`StatusModule: Expired {expiredCount} status effects in this heartbeat.`) end
+	if type(tag) ~= "string" or tag == "" then
+		warn("StatusModule: Cannot get statuses by tag - tag must be a non-empty string.")
+		return {}
+	end
+
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot get statuses by tag - character data not initialized for '{character.Name}'.`)
+		return {}
+	end
+
+	local result = {}
+	for _, status in characterData.ActiveStatuses do
+		if table.find(status.Tags, tag) then table.insert(result, status.StatusName) end
+	end
+
+	return result
 end
 
---// Connections \\--
+function StatusModule.addTag(character: Character, statusName: string, tag: string)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot add tag - invalid character model provided.")
+		return
+	end
 
----
--- Heartbeat function to manage durations
---
-RunService.Heartbeat:Connect(StatusModule.advanceState)
+	if type(statusName) ~= "string" or statusName == "" then
+		warn("StatusModule: Cannot add tag - statusName must be a non-empty string.")
+		return
+	end
 
----
--- Handle remote requests for status sync
---
-if IS_SERVER then
-	SYNC_REQUEST_REMOTE.OnServerInvoke = function(player: Player): (SyncRequestData | { [Model]: SyncRequestData })?
-		if not player or not player:IsA("Player") then
-			warn("StatusModule: Invalid player requested sync data.")
-			return nil
+	if type(tag) ~= "string" or tag == "" then
+		warn("StatusModule: Cannot add tag - tag must be a non-empty string.")
+		return
+	end
+
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot add tag - character data not initialized for '{character.Name}'.`)
+		return
+	end
+
+	local _, status = findStatus(character, statusName)
+	if not status then
+		warn(`StatusModule: Cannot add tag - status '{statusName}' not found for character '{character.Name}'.`)
+		return
+	end
+
+	if not table.find(status.Tags, tag) then table.insert(status.Tags, tag) end
+end
+
+function StatusModule.removeTag(character: Character, statusName: string, tag: string)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot remove tag - invalid character model provided.")
+		return
+	end
+
+	if type(statusName) ~= "string" or statusName == "" then
+		warn("StatusModule: Cannot remove tag - statusName must be a non-empty string.")
+		return
+	end
+
+	if type(tag) ~= "string" or tag == "" then
+		warn("StatusModule: Cannot remove tag - tag must be a non-empty string.")
+		return
+	end
+
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot remove tag - character data not initialized for '{character.Name}'.`)
+		return
+	end
+
+	local _, status = findStatus(character, statusName)
+	if not status then
+		warn(`StatusModule: Cannot remove tag - status '{statusName}' not found for character '{character.Name}'.`)
+		return
+	end
+
+	local index = table.find(status.Tags, tag)
+	if index then table.remove(status.Tags, index) end
+end
+
+function StatusModule.getStackCount(character: Character, statusName: string): number?
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot get stack count - invalid character model provided.")
+		return nil
+	end
+
+	if type(statusName) ~= "string" or statusName == "" then
+		warn("StatusModule: Cannot get stack count - statusName must be a non-empty string.")
+		return nil
+	end
+
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot get stack count - character data not initialized for '{character.Name}'.`)
+		return nil
+	end
+
+	local _, status = findStatus(character, statusName)
+	if not status then
+		warn(`StatusModule: Cannot get stack count - status '{statusName}' not found for character '{character.Name}'.`)
+		return nil
+	end
+
+	return status.StackCount
+end
+
+function StatusModule.addStack(character: Character, statusName: string, count: number?)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot add stack - invalid character model provided.")
+		return
+	end
+
+	if type(statusName) ~= "string" or statusName == "" then
+		warn("StatusModule: Cannot add stack - statusName must be a non-empty string.")
+		return
+	end
+
+	if count ~= nil and type(count) ~= "number" then
+		warn("StatusModule: Cannot add stack - count must be a number or nil.")
+		return
+	end
+
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot add stack - character data not initialized for '{character.Name}'.`)
+		return
+	end
+
+	local _, status = findStatus(character, statusName)
+	if not status then
+		warn(`StatusModule: Cannot add stack - status '{statusName}' not found for character '{character.Name}'.`)
+		return
+	end
+
+	status.StackCount = status.StackCount + (count or 1)
+	if status.StackCount <= 0 then
+		StatusModule.remove(character, statusName)
+		return
+	end
+	updateCharacter(character)
+end
+
+function StatusModule.removeStack(character: Character, statusName: string, count: number?)
+	if count ~= nil and type(count) ~= "number" then
+		warn("StatusModule: Cannot remove stack - count must be a number or nil.")
+		return
+	end
+	return StatusModule.addStack(character, statusName, -(count or 1))
+end
+
+function StatusModule.getEffectiveProperty(character: Character, property: string): any
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot get effective property - invalid character model provided.")
+		return nil
+	end
+
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot get effective property - character data not initialized for '{character.Name}'.`)
+		return nil
+	end
+
+	local baseValue = characterData.DefaultProperties[property]
+	if baseValue == nil then
+		warn(
+			`StatusModule: Cannot get effective property - property '{property}' not found in character '{character.Name}' default properties.`
+		)
+		return nil
+	end
+
+	-- Same calculation logic as updateCharacter but for single property
+	local effectiveValue
+
+	for _, status in characterData.ActiveStatuses do
+		if status.Paused then continue end
+		local effect = status.Properties[property]
+		if not effect then continue end
+
+		local stackType = effect.StackType
+
+		if not effectiveValue then
+			if effect.StackType == STACK_TYPE_SET then
+				return effect.Value -- Set overrides all other effects
+			end
+			effectiveValue = baseValue
 		end
 
-		if SYNC_ALL_CHARACTERS then
-			local syncData: { [Model]: SyncRequestData } = {}
-
-			for character, statuses in activeStatuses do
-				if not character:IsA("Model") then
-					warn(`StatusModule: Invalid character model found in activeStatuses during sync - skipping.`)
-					continue
-				end
-
-				local allStatuses = statuses or {}
-				local defaultProps = defaultProperties[character] or {}
-
-				if not defaultProps or next(defaultProps) == nil then
-					warn(`StatusModule: No default properties found for character '{character.Name}' during sync.`)
-				end
-
-				syncData[character] = {
-					AllStatuses = allStatuses,
-					DefaultProperties = defaultProps,
-					Timestamp = getTime(),
-				}
-			end
-
-			return writeSyncRequestData(syncData)
-		else
-			local character = player.Character
-			if not character or not character:IsA("Model") then
-				warn(`StatusModule: Player '{player.Name}' requested sync but has no valid character.`)
-				return nil
-			end
-
-			if not characterList[character] then StatusModule.initCharacter(character) end
-
-			-- return all information client needed to sync
-			local allStatuses = activeStatuses[character] or {}
-			local defaultProps = defaultProperties[character] or {}
-
-			if not defaultProps or next(defaultProps) == nil then
-				warn(`StatusModule: No default properties found for character '{character.Name}' during sync request.`)
-			end
-
-			return writeSyncRequestData({
-				AllStatuses = allStatuses,
-				DefaultProperties = defaultProps,
-				Timestamp = getTime(),
-			})
+		if stackType == STACK_TYPE_ADD then
+			effectiveValue = effectiveValue + effect.Value
+		elseif stackType == STACK_TYPE_MULTIPLY then
+			effectiveValue = effectiveValue + baseValue * (effect.Value - 1)
 		end
 	end
-else
-	STATUS_SYNC_REMOTE.OnClientEvent:Connect(function(syncData: SyncData)
-		syncData = readSyncData(syncData)
 
-		if type(syncData) ~= "table" then
-			warn("StatusModule: Received invalid sync data from server - expected table.")
-			return
-		end
+	return effectiveValue or baseValue
+end
 
-		local character = syncData.Character
-		local action = syncData.Action
-		local timestamp = syncData.Timestamp
+function StatusModule.getBaseProperty(character: Character, property: string): any
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot get base property - invalid character model provided.")
+		return nil
+	end
 
-		if not character or not action or not character:IsA("Model") then
-			warn(
-				"StatusModule: Received incomplete sync data from server - missing character, action, or invalid character type."
-			)
-			return
-		end
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot get base property - character data not initialized for '{character.Name}'.`)
+		return nil
+	end
 
-		if not timestamp then
-			warn(
-				`StatusModule: Received sync data without timestamp for action '{action}' on character '{character.Name}' - using current time.`
-			)
-			timestamp = getTime()
-		end
+	return characterData.DefaultProperties[property]
+end
 
-		if syncData.Action == "apply" then
-			local statusName = syncData.StatusName
-			local statusInfo = syncData.StatusInfo
+function StatusModule.setBaseProperty(character: Character, property: string, value: any): ()
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot set base property - invalid character model provided.")
+		return
+	end
 
-			if not statusName then
-				warn(`StatusModule: Received apply action without valid statusName for character '{character.Name}'.`)
-				return
-			end
+	if type(property) ~= "string" or property == "" then
+		warn("StatusModule: Cannot set base property - property must be a non-empty string.")
+		return
+	end
 
-			if not statusInfo then
-				warn(
-					`StatusModule: Received apply action without statusInfo for status '{statusName}' on character '{character.Name}'.`
-				)
-				return
-			end
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot set base property - character data not initialized for '{character.Name}'.`)
+		return
+	end
+	characterData.DefaultProperties[property] = value
 
-			statusInfo.Timestamp = timestamp
+	updateCharacter(character)
+end
 
-			StatusModule.apply(character, statusName, statusInfo)
-		elseif syncData.Action == "remove" then
-			local statusName = syncData.StatusName
+function StatusModule.setCustomHandler(
+	character: Character,
+	property: string,
+	handler: (character: Character, property: string, value: any) -> ()
+)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot set custom handler - invalid character model provided.")
+		return
+	end
 
-			if not statusName then
-				warn(`StatusModule: Received remove action without valid statusName for character '{character.Name}'.`)
-				return
-			end
+	if type(property) ~= "string" or property == "" then
+		warn("StatusModule: Cannot set custom handler - property must be a non-empty string.")
+		return
+	end
 
-			if not StatusModule.hasStatus(character, statusName) then return end
+	if type(handler) ~= "function" then
+		warn("StatusModule: Cannot set custom handler - handler must be a function.")
+		return
+	end
 
-			StatusModule.remove(character, statusName, timestamp)
-		elseif syncData.Action == "clear" then
-			StatusModule.clearAllStatuses(character, timestamp)
-		else
-			warn(`StatusModule: Unknown action '{action}' received from server for character '{character.Name}'.`)
-		end
-	end)
+	local characterData = ensureCharacterData(character)
+	characterData.CustomHandlers[property] = handler
+end
 
-	local function initializeCharacter(character: Model, syncData: SyncRequestData)
-		if not character or not character:IsA("Model") then
-			warn("StatusModule: Cannot initialize character - invalid character model provided.")
-			return
-		end
+function StatusModule.removeCustomHandler(character: Character, property: string)
+	if not (character and typeof(character) == "Instance" and character:IsA("Model")) then
+		warn("StatusModule: Cannot remove custom handler - invalid character model provided.")
+		return
+	end
 
-		if not syncData then
-			warn(`StatusModule: Cannot initialize character '{character.Name}' - no sync data provided.`)
-			return
-		end
+	if type(property) ~= "string" or property == "" then
+		warn("StatusModule: Cannot remove custom handler - property must be a non-empty string.")
+		return
+	end
 
-		if not syncData.DefaultProperties then
-			warn(`StatusModule: No default properties provided for character '{character.Name}' during initialization.`)
-		end
+	local characterData = getCharacterData(character)
+	if not characterData then
+		warn(`StatusModule: Cannot remove custom handler - character data not initialized for '{character.Name}'.`)
+		return
+	end
 
-		StatusModule.initCharacter(character, syncData.DefaultProperties)
+	characterData.CustomHandlers[property] = nil
+end
 
-		for statusName, status in syncData.AllStatuses do
-			if not status.Properties or not status.Priority or not status.Duration or not status.Timestamp then
-				warn(
-					`StatusModule: Incomplete status data for '{statusName}' on character '{character.Name}' during initialization - skipping.`
-				)
+function StatusModule.advanceState(deltaTime: number?)
+	local dt = deltaTime or 0
+
+	for character, characterData in characterDataList do
+		for i = #characterData.ActiveStatuses, 1, -1 do
+			local status = characterData.ActiveStatuses[i]
+			if status.Paused then continue end
+
+			local onTick = status.OnTick
+			if onTick then task.spawn(onTick, character, dt) end
+
+			if status.Duration == math.huge then
+				-- Infinite duration, no need to update
 				continue
 			end
 
-			StatusModule.apply(character, statusName, {
-				Priority = status.Priority,
-				Duration = status.Duration,
-				Properties = status.Properties,
-				Timestamp = status.Timestamp,
-			})
+			status.RemainingDuration = status.RemainingDuration - dt
+			if status.RemainingDuration > 0 then continue end
+
+			table.remove(characterData.ActiveStatuses, i)
+
+			local onRemove = status.OnRemove
+			if onRemove then task.spawn(onRemove, character, false) end
+
+			updateCharacter(character)
+
+			for _, callback in statusCallbacks.OnStatusRemoved do
+				task.spawn(callback, character, status.StatusName, false)
+			end
+
+			if IS_SERVER then
+				syncStatusChange({
+					Action = "remove" :: "remove",
+					Character = character,
+					StatusName = status.StatusName,
+					Timestamp = getTime(),
+				})
+			end
+		end
+	end
+end
+
+function StatusModule.BindToStatusAdded(
+	callback: (character: Character, statusName: string, statusInfo: StatusInfo) -> ()
+): disconnect
+	if type(callback) ~= "function" then error("StatusModule: Cannot bind to status added - callback must be a function.", 2) end
+	table.insert(statusCallbacks.OnStatusAdded, callback)
+
+	local disconnected = false
+	return function()
+		if disconnected then return end
+		disconnected = true
+		local index = table.find(statusCallbacks.OnStatusAdded, callback)
+		if index then table.remove(statusCallbacks.OnStatusAdded, index) end
+	end
+end
+
+function StatusModule.BindToStatusChanged(callback: (
+	character: Character,
+	statusName: string,
+	oldStatusInfo: StatusInfo?,
+	newStatusInfo: StatusInfo
+) -> ()): disconnect
+	if type(callback) ~= "function" then
+		error("StatusModule: Cannot bind to status changed - callback must be a function.", 2)
+	end
+	table.insert(statusCallbacks.OnStatusChanged, callback)
+
+	local disconnected = false
+	return function()
+		if disconnected then return end
+		disconnected = true
+		local index = table.find(statusCallbacks.OnStatusChanged, callback)
+		if index then table.remove(statusCallbacks.OnStatusChanged, index) end
+	end
+end
+
+function StatusModule.BindToStatusRemoved(
+	callback: (character: Character, statusName: string, removedByUser: boolean) -> ()
+): disconnect
+	if type(callback) ~= "function" then
+		error("StatusModule: Cannot bind to status removed - callback must be a function.", 2)
+	end
+	table.insert(statusCallbacks.OnStatusRemoved, callback)
+
+	local disconnected = false
+	return function()
+		if disconnected then return end
+		disconnected = true
+		local index = table.find(statusCallbacks.OnStatusRemoved, callback)
+		if index then table.remove(statusCallbacks.OnStatusRemoved, index) end
+	end
+end
+
+-- Enums
+StatusModule.StackType = STACK_TYPE_ENUM
+StatusModule.ApplyType = APPLY_TYPE_ENUM
+
+--// Connections \\--
+
+RunService.Heartbeat:Connect(StatusModule.advanceState)
+
+--// Server Sync Handling \\--
+
+if IS_SERVER then
+	local function handleSyncRequest(player: Player, targetCharacter: Character?): { initCharacterData }?
+		local config = getConfig()
+
+		if config.SyncBehaviour == "NoSync" then
+			warn("StatusModule: Sync behaviour is set to 'NoSync'. Cannot request sync data.")
+			return nil
 		end
 
-		-- Update the character with the initial properties
-		updateCharacter(character)
+		if config.SyncBehaviour == "SyncAllCharacters" then
+			local syncList = {}
+			for character, characterData in characterDataList do
+				table.insert(syncList, {
+					Id = characterData.Id,
+					ActiveStatuses = table.clone(characterData.ActiveStatuses),
+					DefaultProperties = table.clone(characterData.DefaultProperties),
+					Timestamp = getTime(),
+				})
+			end
+
+			return syncList
+		elseif config.SyncBehaviour == "SyncAllOwnedCharacters" then
+			local syncList = {}
+			for _, characterData in characterDataList do
+				if not characterData.OwnedPlayer then continue end
+				table.insert(syncList, {
+					Id = characterData.Id,
+					ActiveStatuses = table.clone(characterData.ActiveStatuses),
+					DefaultProperties = table.clone(characterData.DefaultProperties),
+					Timestamp = getTime(),
+				})
+			end
+
+			return syncList
+		else -- SyncOwnerOnly (default)
+			local character = player.Character
+			if not character then return nil end
+
+			local characterData = characterDataList[character]
+			if not characterData then
+				-- Initialize and return default properties
+				StatusModule.initCharacter(character)
+				characterData = characterDataList[character]
+			end
+
+			return {
+				{
+					Id = characterData.Id,
+					ActiveStatuses = table.clone(characterData.ActiveStatuses),
+					DefaultProperties = table.clone(characterData.DefaultProperties),
+					Timestamp = getTime(),
+				} :: initCharacterData,
+			}
+		end
 	end
 
-	if SYNC_ALL_CHARACTERS then
-		-- Sync all characters on client initialization
-		local initialSyncData = SYNC_REQUEST_REMOTE:InvokeServer()
-		if initialSyncData then
-			initialSyncData = readSyncRequestData(initialSyncData) :: { [Model]: SyncRequestData }
-			for character, syncData in initialSyncData do
-				initializeCharacter(character, syncData)
-			end
+	SYNC_REQUEST_REMOTE.OnServerInvoke = function(player: Player, flag: string, ...): syncPacket?
+		if flag == REQUEST_INIT_DATA then
+			local result = handleSyncRequest(player, ...)
+			if not result then return nil end
+
+			return writeSyncRequestData(result)
+		elseif flag == REQUEST_DEFAULT_PROPERTIES then
+			error("StatusModule: REQUEST_DEFAULT_PROPERTIES is not supported in server sync requests.", 2)
 		else
-			warn("StatusModule: Failed to retrieve initial sync data from server.")
+			error(`StatusModule: Unknown sync request flag '{flag}'.`, 2)
 		end
-	else
-		local character = Players.LocalPlayer.Character
-		if character then -- only initialize if the character exists
-			local initialSyncData: SyncRequestData = SYNC_REQUEST_REMOTE:InvokeServer()
-			if initialSyncData then
-				initialSyncData = readSyncRequestData(initialSyncData) :: SyncRequestData
-				initializeCharacter(character, initialSyncData)
+	end
+else
+	-- Client sync handling
+	STATUS_SYNC_REMOTE.OnClientEvent:Connect(function(syncPacket: syncPacket)
+		local syncData = readSyncData(syncPacket)
+		local action = syncData.Action
+
+		if not action then return end
+
+		if syncData.Action == "init" then
+			local character = getCharacterFromSyncId(syncData.CharacterId)
+			StatusModule.initCharacter(character, syncData.DefaultProperties)
+		elseif syncData.Action == "apply" then
+			StatusModule.apply(syncData.Character, syncData.StatusName, syncData.StatusInfo, syncData.ApplyType)
+		elseif syncData.Action == "remove" then
+			StatusModule.remove(syncData.Character, syncData.StatusName, syncData.Timestamp)
+		elseif syncData.Action == "clear" then
+			StatusModule.clearAllStatuses(syncData.Character, syncData.Timestamp)
+		elseif syncData.Action == "pause" then
+			if StatusModule.hasStatus(syncData.Character, syncData.StatusName) then
+				StatusModule.pauseStatus(syncData.Character, syncData.StatusName)
 			else
-				warn("StatusModule: Failed to retrieve initial sync data from server.")
+				local statusInfo = syncData.StatusInfo
+				StatusModule.apply(syncData.Character, syncData.StatusName, statusInfo, APPLY_TYPE_SET)
+			end
+		elseif syncData.Action == "resume" then
+			StatusModule.resumeStatus(syncData.Character, syncData.StatusName)
+		elseif syncData.Action == "modifyDuration" then
+			if StatusModule.hasStatus(syncData.Character, syncData.StatusName) then
+				StatusModule.modifyDuration(syncData.Character, syncData.StatusName, syncData.NewDuration)
+			else
+				local statusInfo = syncData.StatusInfo
+				StatusModule.apply(syncData.Character, syncData.StatusName, statusInfo, APPLY_TYPE_SET)
+			end
+		end
+	end)
+
+	do
+		-- Request initial sync for local player character
+		local syncPacket: buffer? = SYNC_REQUEST_REMOTE:InvokeServer(REQUEST_INIT_DATA)
+		if syncPacket then
+			local function init(characterData: initCharacterData)
+				local character = getCharacterFromSyncId(characterData.Id)
+				local activeStatuses = characterData.ActiveStatuses
+				local defaultProperties = characterData.DefaultProperties
+
+				StatusModule.initCharacter(character, defaultProperties)
+				for _, status in activeStatuses do
+					StatusModule.apply(character, status.StatusName, {
+						Priority = status.Priority,
+						Duration = status.Duration,
+						Timestamp = status.Timestamp,
+						StackCount = status.StackCount,
+						Tags = status.Tags,
+						Properties = status.Properties :: { [string]: PropertyEffect },
+					}, APPLY_TYPE_SET)
+				end
+			end
+
+			local syncData = readSyncRequestData(syncPacket)
+
+			for _, characterData in syncData do
+				task.spawn(init, characterData)
 			end
 		end
 	end
