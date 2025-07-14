@@ -5,9 +5,9 @@
 	Handles the application, removal, and prioritization of status effects on characters,
 	with support for stacking effects.
 
-    Author: @akari_yn
-    Date: 2025-07-13
-    Version: 0.2.0
+	Author: @akari_yn
+	Date: 2025-07-15
+	Version: 0.2.0
 
 	---------------------------------------------------------------------------
 	
