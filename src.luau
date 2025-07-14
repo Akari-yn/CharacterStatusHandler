@@ -269,9 +269,9 @@ export type StatusModule = {
 	advanceState: (deltaTime: number?) -> (),
 
 	-- Events
-	BindToStatusAdded: (callback: (character: Character, statusName: string, statusInfo: StatusInfo) -> ()) -> disconnect,
-	BindToStatusRemoved: (callback: (character: Character, statusName: string, removed: boolean) -> ()) -> disconnect,
-	BindToStatusChanged: (
+	bindToStatusAdded: (callback: (character: Character, statusName: string, statusInfo: StatusInfo) -> ()) -> disconnect,
+	bindToStatusRemoved: (callback: (character: Character, statusName: string, removed: boolean) -> ()) -> disconnect,
+	bindToStatusChanged: (
 		callback: (character: Character, statusName: string, oldStatusInfo: StatusInfo, newStatusInfo: StatusInfo) -> ()
 	) -> disconnect,
 
@@ -1596,7 +1596,7 @@ function StatusModule.advanceState(deltaTime: number?)
 	end
 end
 
-function StatusModule.BindToStatusAdded(
+function StatusModule.bindToStatusAdded(
 	callback: (character: Character, statusName: string, statusInfo: StatusInfo) -> ()
 ): disconnect
 	if type(callback) ~= "function" then error("StatusModule: Cannot bind to status added - callback must be a function.", 2) end
@@ -1611,7 +1611,7 @@ function StatusModule.BindToStatusAdded(
 	end
 end
 
-function StatusModule.BindToStatusChanged(callback: (
+function StatusModule.bindToStatusChanged(callback: (
 	character: Character,
 	statusName: string,
 	oldStatusInfo: StatusInfo?,
@@ -1631,7 +1631,7 @@ function StatusModule.BindToStatusChanged(callback: (
 	end
 end
 
-function StatusModule.BindToStatusRemoved(
+function StatusModule.bindToStatusRemoved(
 	callback: (character: Character, statusName: string, removedByUser: boolean) -> ()
 ): disconnect
 	if type(callback) ~= "function" then
