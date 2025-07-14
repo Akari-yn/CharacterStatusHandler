@@ -321,8 +321,8 @@ for applyType, value in APPLY_TYPE_ENUM do
 end
 
 local DEFAULT_DURATION = math.huge
-local DEFAULT_STACK_TYPE: InternalStackType = 0 -- "Set" as default stack type
-local DEFAULT_APPLY_TYPE: InternalApplyType = 0 -- "Set" as default apply type
+local DEFAULT_STACK_TYPE: InternalStackType = STACK_TYPE_SET
+local DEFAULT_APPLY_TYPE: InternalApplyType = APPLY_TYPE_SET
 local DEFAULT_PRIORITY = 0
 local DEFAULT_STACK_COUNT = 1
 
@@ -520,12 +520,33 @@ local function readSyncRequestData(syncPacket: syncPacket): { initCharacterData 
 end
 
 local function syncStatusChange(syncData: ClientSyncData, targetPlayer: Player?)
-	if not IS_SERVER then return end
+	if not IS_SERVER then
+		warn("StatusModule: syncStatusChange can only be called from the server.")
+		return
+	end
+
+	local config = getConfig()
+	if config.SyncBehaviour == "NoSync" then return end -- No synchronization needed
 
 	if targetPlayer then
 		STATUS_SYNC_REMOTE:FireClient(targetPlayer, writeSyncData(syncData))
 	else
-		STATUS_SYNC_REMOTE:FireAllClients(writeSyncData(syncData))
+		if config.SyncBehaviour == "SyncAllCharacters" then
+			-- Sync all characters to all clients
+			STATUS_SYNC_REMOTE:FireAllClients(writeSyncData(syncData))
+		elseif config.SyncBehaviour == "SyncAllOwnedCharacters" then
+			-- Sync all characters owned by the player
+			local characterData = getCharacterData(syncData.Character)
+			if characterData and characterData.OwnedPlayer then
+				STATUS_SYNC_REMOTE:FireAllClients(writeSyncData(syncData))
+			end
+		else -- SyncOwnerOnly
+			-- Sync only to the owner of the character
+			local characterData = getCharacterData(syncData.Character)
+			if characterData and characterData.OwnedPlayer then
+				STATUS_SYNC_REMOTE:FireClient(characterData.OwnedPlayer, writeSyncData(syncData))
+			end
+		end
 	end
 end
 
